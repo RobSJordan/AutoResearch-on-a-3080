@@ -15,7 +15,6 @@ import time
 import math
 import argparse
 import pickle
-from multiprocessing import Pool
 
 import requests
 import pyarrow.parquet as pq
@@ -27,7 +26,7 @@ import torch
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 512        # context length (reduced from 2048 for RTX 3080)
+MAX_SEQ_LEN = 256        # context length
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
 EVAL_TOKENS = 10 * 32768  # number of tokens for val eval (reduced from 40 * 524288)
 
@@ -38,10 +37,9 @@ EVAL_TOKENS = 10 * 32768  # number of tokens for val eval (reduced from 40 * 524
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
+BASE_URL = "https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean/resolve/refs%2Fconvert%2Fparquet/default/train"
+TINYSTORIES_FILENAME = "0000.parquet"
+VAL_ROW_GROUP_FRAC = 0.1  # last 10% of row groups held out for validation
 VOCAB_SIZE = 4096
 
 # BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
@@ -54,18 +52,20 @@ BOS_TOKEN = "<|reserved_0|>"
 # Data download
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
+def download_data(num_shards=1, download_workers=1):
+    """Download TinyStories parquet file."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    filepath = os.path.join(DATA_DIR, TINYSTORIES_FILENAME)
     if os.path.exists(filepath):
-        return True
+        print(f"Data: already downloaded at {filepath}")
+        return
 
-    url = f"{BASE_URL}/{filename}"
+    url = f"{BASE_URL}/{TINYSTORIES_FILENAME}"
+    print(f"Data: downloading TinyStories from {url}...")
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, stream=True, timeout=30)
+            response = requests.get(url, stream=True, timeout=60)
             response.raise_for_status()
             temp_path = filepath + ".tmp"
             with open(temp_path, "wb") as f:
@@ -73,10 +73,10 @@ def download_single_shard(index):
                     if chunk:
                         f.write(chunk)
             os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
+            print(f"  Downloaded {TINYSTORIES_FILENAME}")
+            return
         except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
+            print(f"  Attempt {attempt}/{max_attempts} failed: {e}")
             for path in [filepath + ".tmp", filepath]:
                 if os.path.exists(path):
                     try:
@@ -85,57 +85,32 @@ def download_single_shard(index):
                         pass
             if attempt < max_attempts:
                 time.sleep(2 ** attempt)
-    return False
-
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    print("Data: download failed after all attempts.")
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+def _val_start_rg():
+    """Return the first row group index reserved for validation."""
+    pf = pq.ParquetFile(os.path.join(DATA_DIR, TINYSTORIES_FILENAME))
+    return max(1, int(pf.num_row_groups * (1 - VAL_ROW_GROUP_FRAC)))
 
 
 def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
+    """Yield documents from training split (all row groups except held-out val)."""
+    filepath = os.path.join(DATA_DIR, TINYSTORIES_FILENAME)
+    pf = pq.ParquetFile(filepath)
+    val_start = _val_start_rg()
     nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+    for rg_idx in range(0, val_start):
+        rg = pf.read_row_group(rg_idx)
+        for text in rg.column("text").to_pylist():
+            doc = text[:doc_cap] if len(text) > doc_cap else text
+            nchars += len(doc)
+            yield doc
+            if nchars >= max_chars:
+                return
 
 
 def train_tokenizer():
@@ -149,9 +124,8 @@ def train_tokenizer():
 
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+    if not os.path.exists(os.path.join(DATA_DIR, TINYSTORIES_FILENAME)):
+        print("Tokenizer: data file not found. Run prepare.py to download first.")
         sys.exit(1)
 
     # --- Train with rustbpe ---
@@ -252,23 +226,19 @@ def get_token_bytes(device="cpu"):
 
 
 def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-    else:
-        parquet_paths = [val_path]
+    """Infinite iterator over document batches from parquet file."""
+    filepath = os.path.join(DATA_DIR, TINYSTORIES_FILENAME)
+    assert os.path.exists(filepath), f"Data file not found: {filepath}. Run prepare.py first."
+    pf = pq.ParquetFile(filepath)
+    val_start = _val_start_rg()
+    rg_indices = list(range(0, val_start) if split == "train" else range(val_start, pf.num_row_groups))
     epoch = 1
     while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
+        for rg_idx in rg_indices:
+            rg = pf.read_row_group(rg_idx)
+            batch = rg.column('text').to_pylist()
+            for i in range(0, len(batch), tokenizer_batch_size):
+                yield batch[i:i+tokenizer_batch_size], epoch
         epoch += 1
 
 
